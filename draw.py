@@ -2,7 +2,13 @@
 
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox, simpledialog
-import math, random, json, os, time
+import math, random, json, os, time, threading
+
+try:
+    from openai import OpenAI
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
 
 
 class Layer:
@@ -88,6 +94,9 @@ class ArtCanvas:
         self._tooltip_win   = None
         # Cursor circle
         self.cursor_id      = None
+        # AI Draw
+        self._ai_api_key    = os.environ.get("OPENAI_API_KEY", "")
+        self._ai_generating = False
         # Fullscreen
         self.is_fullscreen  = False
         # Auto-save
@@ -163,6 +172,7 @@ class ArtCanvas:
                                ("Flip H", lambda: self._flip_view('H'), self.TB_BG),
                                ("Flip V", lambda: self._flip_view('V'), self.TB_BG),
                                ("⛶ Full", self._toggle_fullscreen, self.TB_BG),
+                               ("🤖 AI", self._open_ai_prompt, "#0D47A1"),
                                ("💾 PNG", self._save_png,  "#2E7D32"),
                                ("📁 Save", self._save_project, "#1565C0"),
                                ("📂 Load", self._load_project, "#4527A0"),
@@ -191,9 +201,43 @@ class ArtCanvas:
         sb_l_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb_l_scroll = tk.Scrollbar(sb_l_wrap, orient=tk.VERTICAL, command=sb_l_cv.yview)
         sb_l_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        try:
+            sb_l_scroll.configure(width=14)
+        except Exception:
+            pass
         sb_l_cv.configure(yscrollcommand=sb_l_scroll.set)
         sb_l = tk.Frame(sb_l_cv, bg=self.TB_BG, width=68)
         sb_l_id = sb_l_cv.create_window((0, 0), window=sb_l, anchor="nw")
+
+        # Fixed scroll controls (overlay) for accessibility
+        nav_style = {"font": ("Segoe UI", 8, "bold"), "bg": "#1A1A1A", "fg": "#CCC",
+                     "padx": 6, "pady": 2, "cursor": "hand2", "highlightthickness": 1,
+                     "highlightbackground": self.DIVIDER}
+        sb_up = tk.Label(sb_l_wrap, text="▲", **nav_style)
+        sb_dn = tk.Label(sb_l_wrap, text="▼", **nav_style)
+
+        def _nav_pos(_e=None):
+            try:
+                h = sb_l_wrap.winfo_height()
+                x = 20
+                sb_up.place(x=x, y=4, width=28, height=16)
+                sb_dn.place(x=x, y=max(22, h-20), width=28, height=16)
+            except Exception:
+                pass
+
+        def _scroll_steps(steps):
+            try:
+                sb_l_cv.yview_scroll(steps, "units")
+            except Exception:
+                pass
+
+        sb_up.bind("<Button-1>", lambda e: _scroll_steps(-5))
+        sb_dn.bind("<Button-1>", lambda e: _scroll_steps(5))
+        sb_l_wrap.bind("<Configure>", _nav_pos)
+        try:
+            self.root.after(0, _nav_pos)
+        except Exception:
+            pass
 
         def _sb_l_configure(_e=None):
             sb_l_cv.configure(scrollregion=sb_l_cv.bbox("all"))
@@ -203,11 +247,22 @@ class ArtCanvas:
                 pass
         sb_l.bind("<Configure>", _sb_l_configure)
         sb_l_cv.bind("<Configure>", _sb_l_configure)
+        try:
+            self.root.after(0, _sb_l_configure)
+        except Exception:
+            pass
 
         def _sb_l_mousewheel(e):
-            delta = -1 if e.delta > 0 else 1
-            sb_l_cv.yview_scroll(delta, "units")
+            try:
+                step = int(-e.delta / 120) if getattr(e, 'delta', 0) else 0
+                if step == 0:
+                    step = -1 if getattr(e, 'num', 0) == 4 or e.delta > 0 else 1
+            except Exception:
+                step = 1
+            sb_l_cv.yview_scroll(step, "units")
         sb_l_cv.bind("<MouseWheel>", _sb_l_mousewheel)
+        sb_l_wrap.bind("<MouseWheel>", _sb_l_mousewheel)
+        sb_l.bind("<MouseWheel>", _sb_l_mousewheel)
         self.tls = {}
 
         # --- BRUSHES ---
@@ -228,6 +283,17 @@ class ArtCanvas:
                         ("〰️","Dashed"), ("➡️","Arrow")]:
             self._add_tool_btn(sb_l, ic, nm)
 
+        # --- AI DRAW (moved higher for visibility) ---
+        self._section_divider(sb_l)
+        self._section_label(sb_l, "AI DRAW")
+        ai_btn = tk.Label(sb_l, text="🤖 AI Prompt",
+                  font=("Segoe UI", 10, "bold"),
+                  bg="#1A0A3E", fg="#B39DFF", pady=8, cursor="hand2",
+                  highlightthickness=1, highlightbackground=self.ACCENT_GLOW)
+        ai_btn.pack(fill=tk.X, pady=2)
+        ai_btn.bind("<Button-1>", lambda e: self._open_ai_prompt())
+        self._attach_tooltip(ai_btn, "Draw with AI — describe what you want")
+
         # --- UTILITY ---
         self._section_divider(sb_l)
         self._section_label(sb_l, "UTILITY")
@@ -239,6 +305,8 @@ class ArtCanvas:
         self._attach_tooltip(er, "Eraser")
         self.tls["Eraser"] = er
         self._add_tool_btn(sb_l, "🔍", "Color Pick")
+
+        
 
         self.tls["Marker"].configure(bg=self.ACCENT_GLOW)
 
@@ -604,6 +672,9 @@ class ArtCanvas:
         self.root.bind("<Control-minus>", lambda e: self._zoom_at_center(0.9))
         # Fullscreen toggle
         self.root.bind("<F11>", lambda e: self._toggle_fullscreen())
+        # AI Prompt quick open
+        self.root.bind("<Control-g>", lambda e: self._open_ai_prompt())
+        self.root.bind("<F9>", lambda e: self._open_ai_prompt())
 
     def _zoom_at_center(self, s):
         """Zoom relative to canvas center (for keyboard shortcuts)."""
@@ -637,6 +708,7 @@ class ArtCanvas:
             ("Mouse Wheel", "Zoom at cursor"),
             ("Middle-drag", "Pan canvas"),
             ("Ctrl+= / Ctrl-", "Zoom in / out"),
+            ("Ctrl+G / F9", "Open AI Prompt"),
             ("F1 / ?", "Toggle this help"),
         ]
         for k, d in lines:
@@ -1406,6 +1478,268 @@ class ArtCanvas:
             x1 - px * shaft_w,  y1 - py * shaft_w,    # shaft right start
         ]
         return pts
+
+    # ══════════════════════════════════════════════════════════════
+    #  AI PROMPT DRAWING (OpenAI)
+    # ══════════════════════════════════════════════════════════════
+
+    def _open_ai_prompt(self):
+        """Open a floating AI prompt window."""
+        if self._ai_generating:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("✦ AI Draw — Describe Your Drawing")
+        win.configure(bg="#0D0D1A")
+        win.geometry("560x370")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.transient(self.root)
+        win.grab_set()
+
+        # Header
+        hdr = tk.Frame(win, bg="#0D0D1A")
+        hdr.pack(fill=tk.X, padx=20, pady=(18, 6))
+        tk.Label(hdr, text="🤖 AI Drawing Assistant",
+                 font=("Segoe UI", 14, "bold"),
+                 fg=self.ACCENT_GLOW, bg="#0D0D1A").pack(anchor="w")
+        tk.Label(hdr, text="Describe what you want to draw in natural language.",
+                 font=("Segoe UI", 9),
+                 fg="#888", bg="#0D0D1A").pack(anchor="w", pady=(2, 0))
+
+        # API Key
+        key_frame = tk.Frame(win, bg="#0D0D1A")
+        key_frame.pack(fill=tk.X, padx=20, pady=(10, 4))
+        tk.Label(key_frame, text="API Key:",
+                 font=("Segoe UI", 8, "bold"),
+                 fg="#666", bg="#0D0D1A").pack(side=tk.LEFT)
+        key_var = tk.StringVar(value=self._ai_api_key)
+        key_entry = tk.Entry(key_frame, textvariable=key_var,
+                             font=("Consolas", 9), bg="#111128", fg="#AAA",
+                             insertbackground="#AAA", show="•",
+                             highlightthickness=1, highlightbackground="#333",
+                             relief=tk.FLAT)
+        key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        # Prompt
+        prompt_frame = tk.Frame(win, bg="#0D0D1A")
+        prompt_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(8, 4))
+        tk.Label(prompt_frame, text="Prompt:",
+                 font=("Segoe UI", 8, "bold"),
+                 fg="#666", bg="#0D0D1A").pack(anchor="w")
+        prompt_text = tk.Text(prompt_frame, font=("Segoe UI", 11),
+                              bg="#111128", fg="#E0E0FF",
+                              insertbackground="#E0E0FF",
+                              highlightthickness=1, highlightbackground="#333",
+                              relief=tk.FLAT, height=5, wrap=tk.WORD)
+        prompt_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        prompt_text.insert("1.0", "A cute cat sitting on a crescent moon")
+        prompt_text.focus_set()
+        prompt_text.tag_add("sel", "1.0", "end")
+
+        # Status
+        status_var = tk.StringVar(value="")
+        status_lbl = tk.Label(win, textvariable=status_var,
+                              font=("Segoe UI", 8),
+                              fg="#FF6B35", bg="#0D0D1A")
+        status_lbl.pack(padx=20, anchor="w")
+
+        # Buttons
+        btn_frame = tk.Frame(win, bg="#0D0D1A")
+        btn_frame.pack(fill=tk.X, padx=20, pady=(6, 16))
+
+        cancel_btn = tk.Label(btn_frame, text="Cancel",
+                              font=("Segoe UI", 10, "bold"),
+                              fg="#888", bg="#1A1A2E",
+                              padx=20, pady=8, cursor="hand2")
+        cancel_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        cancel_btn.bind("<Button-1>", lambda e: win.destroy())
+
+        gen_btn = tk.Label(btn_frame, text="✦ Generate Drawing",
+                           font=("Segoe UI", 10, "bold"),
+                           fg="#FFF", bg="#5A3FD6",
+                           padx=20, pady=8, cursor="hand2")
+        gen_btn.pack(side=tk.RIGHT)
+
+        def on_generate(_e=None):
+            prompt = prompt_text.get("1.0", "end").strip()
+            api_key = key_var.get().strip()
+            if not api_key:
+                status_var.set("⚠ Please enter your OpenAI API key.")
+                return
+            if not prompt:
+                status_var.set("⚠ Please enter a drawing prompt.")
+                return
+            self._ai_api_key = api_key
+            self._ai_generating = True
+            gen_btn.configure(text="⏳ Generating…", bg="#333")
+            status_var.set("Sending to OpenAI…")
+
+            def worker():
+                try:
+                    result = self._ai_call(api_key, prompt)
+                    self.root.after(0, lambda: self._ai_render(result, win, status_var, gen_btn))
+                except Exception as ex:
+                    self.root.after(0, lambda: self._ai_error(str(ex), status_var, gen_btn))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        gen_btn.bind("<Button-1>", on_generate)
+        prompt_text.bind("<Control-Return>", on_generate)
+
+    def _ai_call(self, api_key, prompt):
+        """Call OpenAI API to generate drawing primitives from a text prompt."""
+        if not HAS_OPENAI:
+            raise RuntimeError(
+                "The 'openai' package is not installed.\n"
+                "Run: pip install openai")
+
+        client = OpenAI(api_key=api_key)
+
+        canvas_w = self.canvas.winfo_width() or 1300
+        canvas_h = self.canvas.winfo_height() or 800
+
+        system_prompt = f"""You are an AI drawing assistant for a canvas-based drawing app.
+The canvas is {canvas_w}x{canvas_h} pixels with a dark background ({self.canvas_bg}).
+
+When the user describes something to draw, you MUST respond with ONLY a valid JSON object (no markdown, no explanation, no code fences) containing drawing primitives.
+
+The JSON format is:
+{{
+  "title": "short description",
+  "primitives": [
+    {{
+      "type": "line",
+      "coords": [x1, y1, x2, y2],
+      "color": "#RRGGBB",
+      "width": 3
+    }},
+    {{
+      "type": "oval",
+      "coords": [x1, y1, x2, y2],
+      "color": "#RRGGBB",
+      "fill": "#RRGGBB",
+      "width": 2
+    }},
+    {{
+      "type": "rectangle",
+      "coords": [x1, y1, x2, y2],
+      "color": "#RRGGBB",
+      "fill": "#RRGGBB",
+      "width": 2
+    }},
+    {{
+      "type": "polygon",
+      "coords": [x1, y1, x2, y2, x3, y3, ...],
+      "color": "#RRGGBB",
+      "fill": "#RRGGBB",
+      "width": 2,
+      "smooth": true
+    }},
+    {{
+      "type": "polyline",
+      "coords": [x1, y1, x2, y2, x3, y3, ...],
+      "color": "#RRGGBB",
+      "width": 3,
+      "smooth": true
+    }}
+  ]
+}}
+
+Rules:
+- Use many primitives (30-150+) to create detailed, artistic drawings.
+- Use rich, vibrant colors. Make the drawing beautiful and artistic.
+- Center the drawing on the canvas. Use the full canvas area wisely.
+- The coordinate system starts at (0,0) top-left to ({canvas_w},{canvas_h}) bottom-right.
+- For curved shapes, use polyline or polygon with smooth=true.
+- Layer shapes back-to-front (backgrounds first, details last).
+- Be creative and artistic. Add shading, highlights, and fine details.
+- Return ONLY the JSON object. No other text."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Draw: {prompt}"}
+            ],
+            temperature=0.8,
+            max_tokens=16000,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            # Remove first and last lines (fences)
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            raw = "\n".join(lines)
+        return json.loads(raw)
+
+    def _ai_render(self, data, win, status_var, gen_btn):
+        """Render the AI-generated drawing primitives on the canvas."""
+        self._ai_generating = False
+        primitives = data.get("primitives", [])
+        title = data.get("title", "AI Drawing")
+        if not primitives:
+            status_var.set("⚠ No drawing data received.")
+            gen_btn.configure(text="✦ Generate Drawing", bg="#5A3FD6")
+            return
+
+        new_group = []
+        tag = "user"
+        for p in primitives:
+            try:
+                ptype = p.get("type", "")
+                coords = p.get("coords", [])
+                color = p.get("color", self.ACCENT1)
+                fill = p.get("fill", "")
+                width = p.get("width", 2)
+                smooth = p.get("smooth", False)
+
+                if not coords or len(coords) < 4:
+                    continue
+
+                tid = None
+                if ptype == "line":
+                    tid = self.canvas.create_line(
+                        *coords, fill=color, width=width,
+                        capstyle=tk.ROUND, tags=tag)
+                elif ptype == "polyline":
+                    tid = self.canvas.create_line(
+                        *coords, fill=color, width=width,
+                        capstyle=tk.ROUND, smooth=smooth, tags=tag)
+                elif ptype == "oval":
+                    tid = self.canvas.create_oval(
+                        *coords, outline=color, fill=fill,
+                        width=width, tags=tag)
+                elif ptype == "rectangle":
+                    tid = self.canvas.create_rectangle(
+                        *coords, outline=color, fill=fill,
+                        width=width, tags=tag)
+                elif ptype == "polygon":
+                    tid = self.canvas.create_polygon(
+                        *coords, outline=color, fill=fill,
+                        width=width, smooth=smooth, tags=tag)
+                if tid:
+                    new_group.append(tid)
+            except Exception:
+                continue
+
+        if new_group:
+            self.undo_stack.append(new_group)
+            self.info_lbl.configure(
+                text=f"AI Draw: {title} ({len(new_group)} shapes)")
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    def _ai_error(self, msg, status_var, gen_btn):
+        """Handle AI generation errors."""
+        self._ai_generating = False
+        gen_btn.configure(text="✦ Generate Drawing", bg="#5A3FD6")
+        # Truncate long errors
+        short = msg[:200] + "…" if len(msg) > 200 else msg
+        status_var.set(f"⚠ {short}")
 
 
 # ═══════════════════════════════════════════════════════════════════
